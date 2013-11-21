@@ -3,7 +3,7 @@
 Plugin Name: Views Output Formats
 Plugin URI: http://wordpress.org/extend/plugins/views-output-formats
 Description: Provides JSON and XML output formats for Toolset Views
-Version: 1.0
+Version: 2.0
 Author: khromov
 Author URI: http://khromov.wordpress.com
 License: GPL2
@@ -52,7 +52,7 @@ class Views_Output_Formats
 		if(	get_query_var('vof_id') !== '' 		&&
 			get_query_var('vof_token') !== '' 	&&
 			get_option('vof_token') !== false 	&&
-			get_option('vof_token') === get_query_var('vof_token') &&
+			(get_query_var('vof_token') === get_option('vof_token') || get_query_var('vof_token') === $this->get_view_vof_token((int)get_query_var('vof_id'))) &&
 			get_post_type((int)get_query_var('vof_id')) === 'view' &&
 			function_exists('wpv_filter_get_posts')
 		)
@@ -66,21 +66,43 @@ class Views_Output_Formats
 			//Get the View query type
 			$view_settings = $WP_Views->get_view_settings((int)get_query_var('vof_id'));
 
+			//Prepare string for output
+			$output = '';
+
+			//Prepare string for data
+			$result = array();
+
+			//Set headers
+			if($format === 'json')
+				header('Content-type: application/json');
+			else
+				header('Content-Type: text/xml');
+
 			//Taxonomy query
 			if($view_settings['query_type'][0] === 'taxonomy')
 			{
-				//FIXME: Not supported yet
+				$result['taxonomies'] = $WP_Views->taxonomy_query($view_settings);
 
-				//$result = $WP_Views->taxonomy_query($view_settings);
-				//print_r($result);
+				if($format === 'json')
+					$output =  json_encode($result);
+				else
+					$output = Views_Output_Formats_XMLSerializer::generateValidXmlFromArray($result, '', 'taxonomy');
 			}
 			else if($view_settings['query_type'][0] === 'users') //User query
 			{
-				//FIXME: Not supported yet
-				//$result = $WP_Views->users_query($view_settings);
+				$result['users'] = $WP_Views->users_query($view_settings);
 
-				//FIXME: This exposes sensitive data such as user_pass per default. Needs to be filtered before output
-				//print_r($result);
+				//Filter sensitive information
+				foreach($result['users'] as &$user)
+				{
+					$user->user_pass = '';
+					$user->user_activation_key = '';
+				}
+
+				if($format === 'json')
+					$output =  json_encode($result);
+				else
+					$output = Views_Output_Formats_XMLSerializer::generateValidXmlFromArray($result, '', 'users');
 			}
 			else //Posts query
 			{
@@ -98,17 +120,11 @@ class Views_Output_Formats
 
 				if($format === 'json')
 				{
-					//Why doesn't this work properly?
-					//status_header('Content-type: application/json');
-
-					header('Content-type: application/json');
-					echo json_encode($posts_finished);
+					$posts_json = array('posts' => $this->views_output_merge_custom_fields($query_result->posts));
+					$output = json_encode($posts_json);
 				}
 				else
 				{
-					//status_header('Content-Type:text/xml');
-					header('Content-Type: text/xml');
-
 					//Do some additional transformation to get the output format we want
 					$posts_tmp = array();
 
@@ -128,12 +144,15 @@ class Views_Output_Formats
 					else
 						$posts_tmp['posts'] = array();
 
-
 					echo Views_Output_Formats_XMLSerializer::generateValidXmlFromArray($posts_tmp, '', 'post');
 				}
 			}
 
-			die(); //Early return
+			//Print output
+			echo $output;
+
+			//Early termination
+			die();
 		}
 	}
 
@@ -156,16 +175,15 @@ class Views_Output_Formats
 											'. $view->post_title .'
 										</td>
 										<td>
-											<a href="'. get_bloginfo('url') .'/?vof_id='.$view->ID.'&vof_format=xml&vof_token='. get_option('vof_token') .'">XML</a>
+											<a href="'. get_bloginfo('url') .'/?vof_id='.$view->ID.'&vof_format=xml&vof_token='. $this->get_view_vof_token($view->ID) .'">XML</a>
 											|
-											<a href="'. get_bloginfo('url') .'/?vof_id='.$view->ID.'&vof_format=json&vof_token='. get_option('vof_token') .'">JSON</a>
+											<a href="'. get_bloginfo('url') .'/?vof_id='.$view->ID.'&vof_format=json&vof_token='. $this->get_view_vof_token($view->ID) .'">JSON</a>
 										</td>
 									</tr>
 									';
 		}
 
 		$views_html_output .= '</table>';
-
 		ob_start();
 		?>
 		<div class="wrap">
@@ -177,7 +195,8 @@ class Views_Output_Formats
 			<div class="info" style="padding-top: 10px;">
 				<?php _e( 'From this screen you can get the URL links for all your Views in XML or JSON formats.', self::text_domain ); ?>
 				<p>
-					<?php _e('Your secret', self::text_domain); ?> <abbr title="<?php _e('The token can be reset by deactivating and reactivating the plugin.', self::text_domain); ?>"><?php _e('API token',self::text_domain); ?> </abbr> <?php _e('is:', self::text_domain); ?> <strong><?php echo get_option('vof_token'); ?></strong> <br/>
+					<?php _e('Your global secret', self::text_domain); ?> <abbr title="<?php _e('The token can be reset by deactivating and reactivating the plugin.', self::text_domain); ?>"><?php _e('API token',self::text_domain); ?> </abbr> <?php _e('is:', self::text_domain); ?> <strong><?php echo get_option('vof_token'); ?></strong> <br/>
+					<?php _e('Each View also has an individual API token that is valid for that view alone.', self::text_domain); ?> <br/>
 				</p>
 				<p>
 					<?php echo $views_html_output; ?>
@@ -226,13 +245,27 @@ class Views_Output_Formats
 	}
 
 	/**
+	 * Return unique token for a View
+	 *
+	 * The token is derived from the master token, which should
+	 * never be used publicly.
+	 */
+	function get_view_vof_token($view_id)
+	{
+		//Use the secondary token to generate an unique token for a specific view
+		return md5((string)$view_id . get_option('vof_secondary_token') . get_option('vof_token'));
+	}
+
+	/**
 	 * Plugin activation function
 	 **/
 	static function activate()
 	{
 		//Create a random API token
 		$token = md5(wp_generate_password());
+		$secondary_token = md5(wp_generate_password());
 		add_option('vof_token', $token);
+		add_option('vof_secondary_token', $secondary_token);
 	}
 
 	/**
@@ -240,8 +273,9 @@ class Views_Output_Formats
 	 */
 	static function deactivate()
 	{
-		//If we re-initialize the plugin, the API key will be changed
+		//If we re-initialize the plugin, the API keys will be changed
 		delete_option('vof_token');
+		delete_option('vof_secondary_token');
 	}
 }
 
@@ -272,6 +306,9 @@ class Views_Output_Formats_XMLSerializer
 		{
 			foreach ($array as $key => $value)
 			{
+				//Check for invalid XML element names
+				$key = (sanitize_key($key) === '') ? 'field' : sanitize_key($key);
+
 				if (is_numeric($key))
 				{
 					$key = $node_name;
